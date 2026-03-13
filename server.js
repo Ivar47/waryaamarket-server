@@ -528,13 +528,15 @@ app.get('/api/admin/signals', (req, res) => {
 
 app.post('/api/admin/signals', (req, res) => {
   if (!requireAdmin(req, res)) return;
-  const { signal } = req.body;
-  if (!signal || !signal.name || !signal.ticker) return res.status(400).json({ error: 'Missing fields' });
-  const signals = cache.get('signals') || [];
+  // Accept flat body: { name, ticker, entry, target, risk, horizon, notes }
+  const { name, ticker, entry, target, risk, horizon, notes } = req.body;
+  if (!name || !ticker) return res.status(400).json({ error: 'Missing fields' });
+  const signal = { name, ticker, entry, target, risk, horizon, notes };
   signal.id = Date.now().toString();
   signal.ts = Math.floor(Date.now() / 1000);
+  const signals = cache.get('signals') || [];
   signals.unshift(signal);
-  cache.set('signals', signals.slice(0, 50), 86400 * 7); // keep 50, 7 days
+  cache.set('signals', signals.slice(0, 50), 86400 * 7);
   res.json({ ok: true, signal });
 });
 
