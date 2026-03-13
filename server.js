@@ -16,6 +16,7 @@ import cors           from 'cors';
 import { WebSocketServer, WebSocket } from 'ws';
 import fetch          from 'node-fetch';
 import { createServer } from 'http';
+import crypto         from 'crypto';
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -463,6 +464,85 @@ app.get('/api/rugcheck', async (req, res) => {
 // Signals — stored in memory cache (set via POST /api/admin/signals)
 app.get('/api/signals', (_, res) => {
   res.json(cache.get('signals') || []);
+});
+
+// ─── SIMPLE JWT ───────────────────────────────────────────────────────────────
+
+function signJWT(payload) {
+  const secret = process.env.JWT_SECRET || 'waryaa-secret';
+  const header  = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
+  const body    = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig     = crypto.createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
+  return `${header}.${body}.${sig}`;
+}
+
+function verifyJWT(token) {
+  try {
+    const secret = process.env.JWT_SECRET || 'waryaa-secret';
+    const [header, body, sig] = token.split('.');
+    const expected = crypto.createHmac('sha256', secret).update(`${header}.${body}`).digest('base64url');
+    if (sig !== expected) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (payload.exp && payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return payload;
+  } catch { return null; }
+}
+
+function requireAdmin(req, res) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace('Bearer ', '').trim();
+  if (!token || !verifyJWT(token)) {
+    res.status(401).json({ error: 'Unauthorized' });
+    return false;
+  }
+  return true;
+}
+
+// ─── ADMIN ROUTES ─────────────────────────────────────────────────────────────
+const loginAttempts = new Map();
+
+app.post('/api/admin/login', (req, res) => {
+  // Rate limit: 5 attempts per minute per IP
+  const ip  = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+  const entry = loginAttempts.get(ip) || { count: 0, start: now };
+  if (now - entry.start > 60000) { entry.count = 0; entry.start = now; }
+  entry.count++;
+  loginAttempts.set(ip, entry);
+  if (entry.count > 5) return res.status(429).json({ error: 'Too many attempts. Wait 1 minute.' });
+
+  const { password } = req.body;
+  const expected = process.env.ADMIN_PASSWORD;
+  if (!password || !expected || password !== expected) {
+    return res.status(401).json({ error: 'Incorrect password' });
+  }
+
+  const token = signJWT({ admin: true, exp: Math.floor(Date.now() / 1000) + 28800 }); // 8h
+  res.json({ token });
+});
+
+app.get('/api/admin/signals', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  res.json(cache.get('signals') || []);
+});
+
+app.post('/api/admin/signals', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const { signal } = req.body;
+  if (!signal || !signal.name || !signal.ticker) return res.status(400).json({ error: 'Missing fields' });
+  const signals = cache.get('signals') || [];
+  signal.id = Date.now().toString();
+  signal.ts = Math.floor(Date.now() / 1000);
+  signals.unshift(signal);
+  cache.set('signals', signals.slice(0, 50), 86400 * 7); // keep 50, 7 days
+  res.json({ ok: true, signal });
+});
+
+app.delete('/api/admin/signals/:id', (req, res) => {
+  if (!requireAdmin(req, res)) return;
+  const signals = (cache.get('signals') || []).filter(s => s.id !== req.params.id);
+  cache.set('signals', signals, 86400 * 7);
+  res.json({ ok: true });
 });
 
 // Health
