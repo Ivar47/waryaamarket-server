@@ -296,44 +296,89 @@ app.get('/api/news', async (req, res) => {
   const hit = cache.get(key);
   if (hit) return res.json(hit);
 
-  // Source 1: CryptoPanic (free, no key needed for basic)
-  let data = await safeFetch(
-    `https://cryptopanic.com/api/free/v1/posts/?auth_token=free&public=true&kind=news${cat !== 'ALL' ? `&currencies=${cat.split(',')[0]}` : ''}`
-  );
-
-  if (data && data.results && data.results.length > 0) {
-    // Normalize to CryptoCompare format so frontend works unchanged
-    const normalized = {
-      Data: data.results.map(item => ({
-        title: item.title,
-        url: item.url,
-        source: item.source?.title || 'CryptoPanic',
-        source_info: { name: item.source?.title || 'Crypto News', img: '' },
-        published_on: Math.floor(new Date(item.published_at).getTime() / 1000),
-        imageurl: '',
-        categories: item.currencies?.map(c => c.code).join('|') || 'Crypto'
-      }))
-    };
-    cache.set(key, normalized, 180);
-    return res.json(normalized);
+  // Helper: parse RSS XML into article objects
+  function parseRSS(xml, sourceName) {
+    const items = [];
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g;
+    let m;
+    while ((m = itemRegex.exec(xml)) !== null) {
+      const block = m[1];
+      const get = (tag) => {
+        const r = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]></${tag}>|<${tag}[^>]*>([^<]*)</${tag}>`);
+        const x = r.exec(block);
+        return x ? (x[1] || x[2] || '').trim() : '';
+      };
+      const title = get('title');
+      const link  = get('link') || get('guid');
+      const pubDate = get('pubDate');
+      const desc = get('description');
+      // extract image from media:content or enclosure or description img tag
+      const imgMatch = block.match(/url="([^"]+\.(jpg|jpeg|png|webp))"/i)
+                    || block.match(/<img[^>]+src="([^"]+)"/i);
+      if (title && link) {
+        items.push({
+          title,
+          url: link,
+          source: sourceName,
+          source_info: { name: sourceName, img: '' },
+          published_on: pubDate ? Math.floor(new Date(pubDate).getTime() / 1000) : Math.floor(Date.now() / 1000),
+          imageurl: imgMatch ? imgMatch[1] : '',
+          categories: 'Crypto'
+        });
+      }
+    }
+    return items;
   }
 
-  // Source 2: CryptoCompare (may work without key for some regions)
-  data = await safeFetch(
+  // Fetch RSS as text (not JSON)
+  async function fetchRSS(url, sourceName) {
+    try {
+      const r = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(8000) });
+      if (!r.ok) return [];
+      const xml = await r.text();
+      return parseRSS(xml, sourceName);
+    } catch(e) {
+      console.warn(`[News] RSS failed: ${sourceName} — ${e.message}`);
+      return [];
+    }
+  }
+
+  // Source 1: CoinDesk RSS (most reliable crypto news RSS)
+  // Source 2: Cointelegraph RSS
+  // Source 3: Bitcoin Magazine RSS
+  const [coindesk, cointelegraph, bitcoinmag] = await Promise.allSettled([
+    fetchRSS('https://www.coindesk.com/arc/outboundfeeds/rss/', 'CoinDesk'),
+    fetchRSS('https://cointelegraph.com/rss', 'CoinTelegraph'),
+    fetchRSS('https://bitcoinmagazine.com/.rss/full/', 'Bitcoin Magazine'),
+  ]);
+
+  const articles = [
+    ...(coindesk.status === 'fulfilled' ? coindesk.value : []),
+    ...(cointelegraph.status === 'fulfilled' ? cointelegraph.value : []),
+    ...(bitcoinmag.status === 'fulfilled' ? bitcoinmag.value : []),
+  ];
+
+  if (articles.length > 0) {
+    // Sort by newest first, deduplicate by title
+    const seen = new Set();
+    const deduped = articles
+      .filter(a => { if (seen.has(a.title)) return false; seen.add(a.title); return true; })
+      .sort((a, b) => b.published_on - a.published_on)
+      .slice(0, 30);
+
+    const result = { Data: deduped };
+    cache.set(key, result, 300); // cache 5 minutes
+    return res.json(result);
+  }
+
+  // Last resort: CryptoCompare (may still work in some regions)
+  const cc = await safeFetch(
     `https://min-api.cryptocompare.com/data/v2/news/?lang=EN${cat !== 'ALL' ? `&categories=${cat}` : ''}`
   );
-  if (data && data.Data && data.Data.length > 0) {
-    cache.set(key, data, 180);
-    return res.json(data);
+  if (cc && cc.Data && cc.Data.length > 0) {
+    cache.set(key, cc, 180);
+    return res.json(cc);
   }
-
-  // Source 3: Coindesk RSS via fetch
-  try {
-    const rss = await safeFetch('https://www.coindesk.com/arc/outboundfeeds/rss/');
-    if (rss) {
-      // Return empty Data array — frontend handles gracefully
-    }
-  } catch(e) {}
 
   return res.status(503).json({ error: 'News unavailable', Data: [] });
 });
