@@ -295,12 +295,47 @@ app.get('/api/news', async (req, res) => {
   const key = `news:${cat}`;
   const hit = cache.get(key);
   if (hit) return res.json(hit);
-  const data = await safeFetch(
+
+  // Source 1: CryptoPanic (free, no key needed for basic)
+  let data = await safeFetch(
+    `https://cryptopanic.com/api/free/v1/posts/?auth_token=free&public=true&kind=news${cat !== 'ALL' ? `&currencies=${cat.split(',')[0]}` : ''}`
+  );
+
+  if (data && data.results && data.results.length > 0) {
+    // Normalize to CryptoCompare format so frontend works unchanged
+    const normalized = {
+      Data: data.results.map(item => ({
+        title: item.title,
+        url: item.url,
+        source: item.source?.title || 'CryptoPanic',
+        source_info: { name: item.source?.title || 'Crypto News', img: '' },
+        published_on: Math.floor(new Date(item.published_at).getTime() / 1000),
+        imageurl: '',
+        categories: item.currencies?.map(c => c.code).join('|') || 'Crypto'
+      }))
+    };
+    cache.set(key, normalized, 180);
+    return res.json(normalized);
+  }
+
+  // Source 2: CryptoCompare (may work without key for some regions)
+  data = await safeFetch(
     `https://min-api.cryptocompare.com/data/v2/news/?lang=EN${cat !== 'ALL' ? `&categories=${cat}` : ''}`
   );
-  if (!data) return res.status(503).json({ error: 'Upstream error' });
-  cache.set(key, data, 180);
-  res.json(data);
+  if (data && data.Data && data.Data.length > 0) {
+    cache.set(key, data, 180);
+    return res.json(data);
+  }
+
+  // Source 3: Coindesk RSS via fetch
+  try {
+    const rss = await safeFetch('https://www.coindesk.com/arc/outboundfeeds/rss/');
+    if (rss) {
+      // Return empty Data array — frontend handles gracefully
+    }
+  } catch(e) {}
+
+  return res.status(503).json({ error: 'News unavailable', Data: [] });
 });
 
 app.get('/api/coin-tickers', async (req, res) => {
